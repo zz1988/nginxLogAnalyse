@@ -1,96 +1,105 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
-	"strings"
 
 	"github.com/astaxie/beego/config"
 	"github.com/hpcloud/tail"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/wangtuanjie/ip17mon"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+const (
+	//正则匹配，根据正则表达式抽取有用信息
+	regexPhase = `([^"]*) - - \[.*\] "([^"]*) /CreditFunc/v2.1/([^"]*) .*" "www.miniscores.cn:([^"]*)" .* "([^"]*)" ".*" ".*" ".*" ".* "([^"]*)" "([^"]*)" "([^"]*)"`
 )
 
 // 初始化IP库
 var (
-	webRequestMonitor = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
-			Name: "nginx_request",
-			Help: "the request summary of nginx",
+	// 记录每个查询请求的耗时
+	webRequestGuage = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "nginx_forwarding_guage",
+			Help: "the request costTime of nginx",
 		},
-		[]string{"ipLocation", "requestType", "serviceName", "statusCode"})
+		[]string{"ipLocation", "requestType", "requestPort", "serviceName", "statusCode", "remoteServer"})
+
+	// 记录每个查询请求的数目
+	webRequestCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "nginx_forwarding",
+			Help: "the request count of nginx",
+		},
+		[]string{"ipLocation", "requestType", "requestPort", "serviceName", "statusCode", "remoteServer"})
 )
 
 func init() {
 	if err := ip17mon.Init("17monipdb.dat"); err != nil {
 		panic(err)
 	}
-	prometheus.MustRegister(webRequestMonitor)
+	prometheus.MustRegister(webRequestGuage)
+	prometheus.MustRegister(webRequestCounter)
 }
 
 func main() {
 	iniconf, _ := config.NewConfig("ini", "nginxAnalyse.conf")
-	go analyseNginxLog(iniconf)
+	// 分析nginx日志
+	go func() {
+		nginxLog := iniconf.String("nginx::log")
+		t, err := tail.TailFile(nginxLog, tail.Config{Follow: true, ReOpen: true, Poll: true})
+		if err != nil {
+			return
+		}
+		for line := range t.Lines {
+			ipLocation, requestType, requestPort, serviceName, statusCode, remoteServer, costTimeAll, _, ok := processLogLine(line.Text)
+			if ok {
+				webRequestGuage.WithLabelValues(ipLocation, requestType, requestPort, serviceName, statusCode, remoteServer).Set(costTimeAll)
+				webRequestCounter.WithLabelValues(ipLocation, requestType, requestPort, serviceName, statusCode, remoteServer).Inc()
+			}
+		}
+	}()
 	http.Handle("/metrics", promhttp.Handler())
 	port := iniconf.String("prometheus::port")
 	log.Println(http.ListenAndServe(":"+port, nil))
 }
 
-// 分析nginx日志
-func analyseNginxLog(iniconf config.Configer) {
-	nginxLog := iniconf.String("nginx::log")
-	t, err := tail.TailFile(nginxLog, tail.Config{Follow: true})
-	if err != nil {
-		return
-	}
-	for line := range t.Lines {
-		ipLocation, requestType, requestMethod, statusCode := processLogLine(line.Text)
-		// fmt.Println(ip, ipLocation, requestType, requestMethod, statusCode)
-		if requestMethod != "" && ipLocation != "" {
-			webRequestMonitor.WithLabelValues(ipLocation, requestType, requestMethod, statusCode).Observe(1)
+//解析nginx日志，返回请求的ip，请求类型，请求端口号，请求方法，返回状态码信息，请求目标地址，请求总耗时，请求单纯耗时
+func processLogLine(tmpLogLine string) (string, string, string, string, string, string, float64, float64, bool) {
+	re := regexp.MustCompile(regexPhase)
+	segs2 := re.FindAllStringSubmatch(tmpLogLine, -1)
+	if len(segs2) > 0 && len(segs2[0]) == 9 {
+		srcIP := segs2[0][1]                                     //请求地址ip
+		requestType := segs2[0][2]                               //请求方法
+		serviceName := segs2[0][3]                               //请求服务名
+		requestPort := segs2[0][4]                               //请求端口
+		statusCode := segs2[0][5]                                //请求状态码
+		remoteServer := segs2[0][6]                              //转发服务地址
+		costTimeAll, _ := strconv.ParseFloat(segs2[0][7], 3)     //总请求耗时
+		costTimeRequest, _ := strconv.ParseFloat(segs2[0][8], 3) //单独请求耗时
+		ipLocation := getLocationByIP(srcIP)
+		if strings.Contains(serviceName, "?") { //如果服务名中包含？，则认为无效，不统计
+			return ipLocation, requestType, requestPort, serviceName, statusCode, remoteServer, costTimeAll, costTimeRequest, false
 		}
+		return ipLocation, requestType, requestPort, serviceName, statusCode, remoteServer, costTimeAll, costTimeRequest, true
 	}
-}
-
-//解析nginx日志，返回请求的ip，请求类型，请求方法，返回状态码信息
-func processLogLine(tmpLogLine string) (string, string, string, string) {
-	ip := strings.TrimSpace(strings.Split(tmpLogLine, "-")[0])
-	otherStr := tmpLogLine[strings.Index(tmpLogLine, "]")+1:]
-	logInfo := strings.Split(otherStr, "\"")
-	requestInfo := strings.Split(logInfo[1], " ")
-	requestType := getStringFromArray(requestInfo, 0)
-	requestUrl := getStringFromArray(requestInfo, 1)
-	requestMethod := requestUrl[strings.LastIndex(requestUrl, "/")+1:]
-	if strings.Index(requestUrl, "?") > 0 {
-		requestMethod = requestUrl[strings.LastIndex(requestUrl, "/")+1 : strings.Index(requestUrl, "?")]
-	}
-	statusInfo := strings.Split(strings.TrimSpace(logInfo[2]), " ")
-	statusCode := getStringFromArray(statusInfo, 0)
-	ipLocation := getLocationByIP(ip)
-	return ipLocation, requestType, requestMethod, statusCode
+	return "", "", "", "", "", "", 0, 0, false
 }
 
 // 根据ip获取地址
 func getLocationByIP(ip string) string {
 	ipLocation, err := ip17mon.Find(ip)
 	if err != nil {
-		fmt.Println("err:", err)
+		log.Println("err:", err)
 		return ""
 	}
 	return getEnNameOfProvince(ipLocation.Region)
 }
-
-// 从字符串数组中获取对应index的字符串，如果找不到，返回空字符串
-func getStringFromArray(strArray []string, index int) string {
-	resultStr := ""
-	if len(strArray) > index {
-		resultStr = strArray[index]
-	}
-	return resultStr
-}
-
+  
 // 获取省份名称的英文名
 func getEnNameOfProvince(srcProvinceName string) string {
 	switch srcProvinceName {
